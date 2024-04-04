@@ -3,52 +3,111 @@
 #
 # A program that reads from STDIN and executes commands.
 
-from typing import Callable, Optional
+from contextlib import contextmanager
 from pathlib import Path
-import time
+from typing import Any
+from enum import Enum
 import sys
 
-from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
-from loguru import logger
-import torch
+from rich.progress import Progress, SpinnerColumn, TextColumn
+from pydantic import BaseModel
+from torch import cuda
+import typer
 
-logger.add(
-    "worker.log",
-    format="{time} {level} {message}",
-    level="INFO",
-    rotation="1 week",
-    compression="zip",
-)
-
-MODEL = "distil-whisper/distil-small.en"
+app = typer.Typer()
 
 
-def check_cuda() -> bool:
+class ModelSize(Enum):
+    SMALL = "small"
+    MEDIUM = "medium"
+    LARGE = "large"
+
+
+MODELS = {
+    ModelSize.SMALL: "distil-whisper/distil-small.en",
+    ModelSize.MEDIUM: "distil-whisper/distil-medium.en",
+    ModelSize.LARGE: "distil-whisper/distil-large-v3",
+}
+
+
+class Status(Enum):
+    SUCCESS = "success"
+    FAIL = "fail"
+
+
+class Msg(Enum):
+    EXIT = "[exit]"
+    ERROR = "[error]"
+    READY = "[ready]"
+    CH_MODEL = "[ch_model]"
+    TRANSCRIBE = "[transcribe]"
+    TRANSCRIPT = "[transcript]"
+
+
+class Response(BaseModel):
+    status: Status
+    message: str
+    data: Any | None = None
+
+
+def printf(msg: Msg, *args) -> None:
+    print(msg.value, *args)
+    sys.stdout.flush()
+
+
+def check_cuda() -> Response:
     """Check if CUDA is available."""
 
     try:
-        return torch.cuda.is_available()
+        return Response(
+            status=Status.SUCCESS,
+            message="CUDA check success",
+            data=cuda.is_available(),
+        )
     except Exception as e:
-        logger.error(f"CUDA error: {e}")
-        return False
+        return Response(
+            status=Status.FAIL,
+            message=f"CUDA check fail: {e}",
+        )
 
 
-def load_model() -> Optional[Callable]:
+@contextmanager
+def progress(description: str):
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        transient=True,
+    ) as pg:
+        pg.add_task(description=description, total=None)
+        yield pg
+
+
+def load_model(model_str: str) -> Response:
     """Load model onto GPU."""
+
+    from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
+    import torch
+
+    import logging
+
+    logging.getLogger("transformers").setLevel(logging.ERROR)
 
     # TODO: rn this only handles short (<30s) clips efficiently
     # TODO: implement the chunking strategy in distil-whisper README
 
     try:
-        device = "cuda:0" if check_cuda() else "cpu"
-        torch_dtype = torch.float16 if check_cuda() else torch.float32
+        device = "cuda:0" if check_cuda().data else "cpu"
+        torch_dtype = torch.float16 if check_cuda().data else torch.float32
 
         model = AutoModelForSpeechSeq2Seq.from_pretrained(
-            MODEL, torch_dtype=torch_dtype, low_cpu_mem_usage=True, use_safetensors=True
+            model_str,
+            torch_dtype=torch_dtype,
+            low_cpu_mem_usage=True,
+            use_safetensors=True,
         )
         model.to(device)
 
-        processor = AutoProcessor.from_pretrained(MODEL)
+        processor = AutoProcessor.from_pretrained(model_str)
 
         pipe = pipeline(
             "automatic-speech-recognition",
@@ -59,66 +118,132 @@ def load_model() -> Optional[Callable]:
             torch_dtype=torch_dtype,
             device=device,
         )
-        return pipe
+        return Response(
+            status=Status.SUCCESS,
+            message="Model loaded.",
+            data=pipe,
+        )
     except Exception as e:
-        logger.error(f"Model loading error: {e}")
-        return None
+        return Response(
+            status=Status.FAIL,
+            message=f"Model loading error: {e}",
+        )
 
 
-def transcribe(pipe, audiofile):
+def transcribe(pipe, audiofile: Path) -> Response:
     """Transcribe audio file."""
 
-    tic = time.time()
+    if not audiofile.exists():
+        return Response(
+            status=Status.FAIL,
+            message="File does not exist.",
+        )
+
     try:
-        result = pipe(audiofile)
-        torch.cuda.empty_cache()
-        return result["text"], time.time() - tic
+        result = pipe(str(audiofile))
+        cuda.empty_cache()
+
+        return Response(
+            status=Status.SUCCESS,
+            message="Transcription success.",
+            data=result["text"],
+        )
     except Exception as e:
-        logger.error(f"Error during transcription: {e}")
-        return "[error] Transcription failed.", 0.0
+        return Response(
+            status=Status.FAIL,
+            message=f"Transcription failed: {e}",
+        )
 
 
-def print_(*args, **kwargs):
-    """Print with flush."""
-    print(*args, **kwargs)
-    sys.stdout.flush()
+@app.command()
+def repl(model: ModelSize = typer.Option("medium")) -> None:
+    """Start transcription REPL."""
 
+    res = load_model(MODELS[model])
+    if res.status == Status.FAIL:
+        printf(Msg.ERROR, res.message)
+        typer.Exit(code=1)
 
-def print_transcript(transcript, duration):
-    """Print transcript and duration"""
-    print_(f"[transcript] {transcript}")
-
-
-if __name__ == "__main__":
-    pipe = load_model()
-
-    print_("[ready]")
+    pipe = res.data
+    del res
+    printf(Msg.READY)
 
     try:
         for line in sys.stdin:
-            if r"\transcribe" in line:
-                cmd, audiofile = line.split()
+            line = line.strip()
 
-                if Path(audiofile).exists():
-                    logger.info(f"Transcribing {audiofile}")
-                    tic = time.time()
+            if line == Msg.EXIT.value:
+                return
 
-                    transcript, duration = transcribe(pipe, audiofile)
-                    print_transcript(transcript, duration)
+            if line.startswith(Msg.TRANSCRIBE.value):
+                try:
+                    audiofile = Path(line.split()[1])
+                except IndexError:
+                    printf(Msg.ERROR, "no audio file provided")
+                    continue
 
-                    logger.info(f"Transcribed {audiofile} in {time.time() - tic:.2f}s")
+                if audiofile.exists():
+                    res = transcribe(pipe, audiofile)
+                    printf(Msg.TRANSCRIPT, res.data)
                 else:
-                    print_("[error] File does not exist.")
+                    printf(Msg.ERROR, "audio file does not exist")
+            elif line.startswith(Msg.CH_MODEL.value):
+                try:
+                    model = ModelSize(line.split()[1])
+                except IndexError:
+                    printf(Msg.ERROR, "no model size provided")
+                    continue
+                except ValueError:
+                    printf(Msg.ERROR, "invalid model size")
+                    continue
 
-            elif r"\exit" in line:
                 del pipe
-                break
+                cuda.empty_cache()
 
+                res = load_model(MODELS[model])
+                if res.status == Status.FAIL:
+                    printf(Msg.ERROR, res.message)
+                    continue
+
+                pipe = res.data
+                del res
+                printf(Msg.READY)
             else:
-                print_("[error] Unknown command.")
+                printf(Msg.ERROR, "unknown command")
     except KeyboardInterrupt:
-        pass
+        return
     except Exception as e:
-        logger.error(f"Unexpected error: {e}")
+        printf(Msg.ERROR, f"unexpected error: {e}")
+        return
 
-    print_("[bye]")
+
+@app.command("transcribe")
+def main(audiofile: Path, model: ModelSize = typer.Option("medium")) -> None:
+    """Transcribe audio file."""
+
+    if not audiofile.exists():
+        typer.echo(f"{audiofile} does not exist")
+        return
+
+    with progress("Loading model..."):
+        res = load_model(MODELS[model])
+
+    if res.status == Status.FAIL:
+        typer.echo(res.message)
+        return
+
+    pipe = res.data
+    del res
+
+    with progress("Transcribing..."):
+        res = transcribe(pipe, audiofile)
+
+    if res.status == Status.FAIL:
+        typer.echo(res.message)
+        return
+
+    typer.echo(res.data)
+
+
+if __name__ == "__main__":
+    app()
